@@ -1,39 +1,48 @@
 import os
 import gradio as gr
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_core.documents import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# 1. RAG KNOWLEDGE BASE
-manual_docs = [
-    Document(
-        page_content="TSB-BMS-304: Error code ERR_BMS_304 indicates a Critical Cell Voltage Imbalance. "
-                     "Threshold delta exceeds 0.35V between parallel cell groups. "
-                     "Action Protocol: Disconnect main contactor, verify wiring harness terminal B, "
-                     "replace battery wiring harness SKU: WH-S1-04, and execute BMS firmware recalibration v2.4.",
-        metadata={"category": "BMS", "code": "ERR_BMS_304"}
-    ),
-    Document(
-        page_content="TSB-CAN-102: Error code ERR_CAN_BUS_102 denotes a CAN Bus Communication Timeout. "
-                     "Occurs when MCU (Motor Controller Unit) fails heartbeat acknowledgement for >500ms. "
-                     "Action Protocol: Inspect 12V auxiliary line, check termination resistor (120 Ohm), "
-                     "replace MCU communication bridge SKU: MCU-BRG-01.",
-        metadata={"category": "Powertrain", "code": "ERR_CAN_BUS_102"}
-    ),
-    Document(
-        page_content="TSB-THM-501: Error code ERR_THM_OVERHEAT_501 indicates Pack Thermal Runaway Warning. "
-                     "Temperature sensors read >62C on central thermal block. "
-                     "Action Protocol: Quarantine vehicle for 45 mins in cooling bay. Inspect liquid cooling loops "
-                     "and replace Thermal Interface Pad SKU: TIP-MOD-09.",
-        metadata={"category": "Thermal", "code": "ERR_THM_501"}
-    )
+# 1. TECHNICAL KNOWLEDGE BASE (RAG)
+TSB_DATABASE = [
+    {
+        "code": "ERR_BMS_304",
+        "category": "BMS",
+        "content": "TSB-BMS-304: Error code ERR_BMS_304 indicates a Critical Cell Voltage Imbalance. "
+                   "Threshold delta exceeds 0.35V between parallel cell groups. "
+                   "Action Protocol: Disconnect main contactor, verify wiring harness terminal B, "
+                   "replace battery wiring harness SKU: WH-S1-04, and execute BMS firmware recalibration v2.4."
+    },
+    {
+        "code": "ERR_CAN_BUS_102",
+        "category": "Powertrain",
+        "content": "TSB-CAN-102: Error code ERR_CAN_BUS_102 denotes a CAN Bus Communication Timeout. "
+                   "Occurs when MCU (Motor Controller Unit) fails heartbeat acknowledgement for >500ms. "
+                   "Action Protocol: Inspect 12V auxiliary line, check termination resistor (120 Ohm), "
+                   "replace MCU communication bridge SKU: MCU-BRG-01."
+    },
+    {
+        "code": "ERR_THM_OVERHEAT_501",
+        "category": "Thermal",
+        "content": "TSB-THM-501: Error code ERR_THM_OVERHEAT_501 indicates Pack Thermal Runaway Warning. "
+                   "Temperature sensors read >62C on central thermal block. "
+                   "Action Protocol: Quarantine vehicle for 45 mins in cooling bay. Inspect liquid cooling loops "
+                   "and replace Thermal Interface Pad SKU: TIP-MOD-09."
+    }
 ]
 
-embedding_fn = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vectorstore = Chroma.from_documents(manual_docs, embedding_fn)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
+# Fast, lightweight vector search (0.01s init time, <10MB RAM)
+docs = [d["content"] for d in TSB_DATABASE]
+vectorizer = TfidfVectorizer().fit(docs)
+doc_vectors = vectorizer.transform(docs)
 
-# 2. TELEMETRY & INVENTORY DB
+def retrieve_tsb(query_code: str) -> str:
+    query_vec = vectorizer.transform([query_code])
+    similarities = cosine_similarity(query_vec, doc_vectors)[0]
+    best_idx = similarities.argmax()
+    return TSB_DATABASE[best_idx]["content"]
+
+# 2. TELEMETRY & ERP TOOLS
 MOCK_TELEMETRY = {
     "S1P-MUM-4401": {"model": "Ola S1 Pro Gen 2", "dtc": "ERR_BMS_304", "delta_v": 0.41, "temp": "38C"},
     "S1A-BLR-9022": {"model": "Ola S1 Air", "dtc": "ERR_CAN_BUS_102", "delta_v": 0.05, "temp": "31C"},
@@ -48,8 +57,7 @@ MOCK_INVENTORY = {
 
 def agentic_diagnose(vin_selection, hub_location):
     vehicle = MOCK_TELEMETRY[vin_selection]
-    retrieved = retriever.invoke(vehicle["dtc"])
-    rag_text = retrieved[0].page_content if retrieved else "No TSB found."
+    rag_text = retrieve_tsb(vehicle["dtc"])
 
     sku = next((k for k in MOCK_INVENTORY if k in rag_text), None)
     inv = MOCK_INVENTORY.get(sku, {"name": "N/A", "stock": 0, "status": "Unavailable", "bay": "N/A"})
@@ -57,7 +65,7 @@ def agentic_diagnose(vin_selection, hub_location):
     trace = [
         f"🔍 [Perception] Ingested CAN data from {vin_selection} ({vehicle['model']})",
         f"📡 [Telemetry Scan] DTC: {vehicle['dtc']} | Voltage Delta: {vehicle['delta_v']}V | Temp: {vehicle['temp']}",
-        f"📚 [Action: RAG Query] Retrieved official engineering manual for {vehicle['dtc']}",
+        f"📚 [Action: Vector RAG Query] Retrieved official engineering manual for {vehicle['dtc']}",
         f"⚙️ [Action: ERP Check] Checked hub warehouse for SKU '{sku}' at {hub_location}",
         f"📦 [Observation] Status: {inv['status']} ({inv['stock']} in stock)"
     ]
